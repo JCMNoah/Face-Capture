@@ -100,6 +100,26 @@ debug_ml_detected = False
 debug_final_detected = False
 debug_detection_history = []
 
+# Enhanced debugging variables
+debug_processed_img = None
+debug_confidence_map = None
+debug_mediapipe_detections = None
+debug_cnn_detections = []
+debug_processing_times = {
+    'ml_inference': 0.0,
+    'mediapipe': 0.0,
+    'total_detection': 0.0,
+    'frame_processing': 0.0
+}
+debug_detection_stats = {
+    'total_frames': 0,
+    'ml_detections': 0,
+    'mediapipe_detections': 0,
+    'final_detections': 0,
+    'false_positives': 0,
+    'false_negatives': 0
+}
+
 # Thread-safe locks
 webcam_lock = threading.Lock()
 game_lock = threading.Lock()
@@ -171,6 +191,8 @@ def game_screen_capture_thread():
 def detection_thread():
     """Dedicated thread for AI detection with hybrid validation and smoothing"""
     global character_detected, face_position, detection_confidence, face_detection
+    global debug_game_img, debug_ml_pred, debug_ml_detected, debug_final_detected, debug_detection_history
+    global debug_mediapipe_detections, debug_processing_times, debug_processed_img, debug_cnn_detections
 
     # Detection smoothing
     detection_history = []
@@ -181,6 +203,9 @@ def detection_thread():
 
     while True:
         try:
+            # Start timing for total detection
+            detection_start_time = time.time()
+
             # Get current game screen
             with game_lock:
                 if game_screen is not None:
@@ -189,22 +214,108 @@ def detection_thread():
                     time.sleep(0.1)
                     continue
 
-            # Run ML detection (expensive operation)
+            # Run CNN ML detection (back to simple, fast approach)
+            ml_start_time = time.time()
+
             gray = cv2.cvtColor(current_game, cv2.COLOR_BGR2GRAY)
             resized = cv2.resize(gray, (INPUT_SIZE, INPUT_SIZE))
             normalized = resized / 255.0
-            flattened = normalized.flatten()
-            input_for_model = np.expand_dims(flattened, axis=0)
+
+            # Prepare input for CNN model (keep 2D structure + channel dimension)
+            cnn_input = np.expand_dims(normalized, axis=-1)  # Add channel dimension
+            input_for_model = np.expand_dims(cnn_input, axis=0)  # Add batch dimension
 
             pred = model.predict(input_for_model, verbose=0)[0][0]
             ml_detected = pred < FACE_THRESHOLD
 
-            # Improved hybrid detection: Use MediaPipe as primary, ML as validation
+            # Smart face localization without slow sliding windows
+            cnn_detections = []
+
+            if ml_detected:
+                # Use a fast 4-quadrant approach to find face location
+                h, w = gray.shape
+
+                # Test 4 main regions: top-left, top-right, bottom-left, bottom-right
+                # Plus center region - total of 5 quick tests
+                regions = [
+                    (0, 0, w//2, h//2),                    # Top-left
+                    (w//2, 0, w//2, h//2),                # Top-right
+                    (0, h//2, w//2, h//2),                # Bottom-left
+                    (w//2, h//2, w//2, h//2),             # Bottom-right
+                    (w//4, h//4, w//2, h//2)              # Center
+                ]
+
+                best_confidence = pred
+                best_region = None
+
+                for i, (rx, ry, rw, rh) in enumerate(regions):
+                    # Extract region
+                    region = gray[ry:ry+rh, rx:rx+rw]
+
+                    # Resize and normalize
+                    resized_region = cv2.resize(region, (INPUT_SIZE, INPUT_SIZE))
+                    normalized = resized_region / 255.0
+
+                    # Prepare input for CNN model
+                    cnn_input = np.expand_dims(normalized, axis=-1)
+                    input_for_model = np.expand_dims(cnn_input, axis=0)
+
+                    # Get prediction for this region
+                    region_pred = model.predict(input_for_model, verbose=0)[0][0]
+
+                    # If this region has better confidence, use it
+                    if region_pred < best_confidence:
+                        best_confidence = region_pred
+                        best_region = (rx, ry, rw, rh)
+
+                # Use the best region found, or fall back to center if none are better
+                if best_region:
+                    x, y, w, h = best_region
+                else:
+                    # Fallback to center region
+                    w, h = gray.shape[1] // 2, gray.shape[0] // 2
+                    x, y = (gray.shape[1] - w) // 2, (gray.shape[0] - h) // 2
+
+                confidence = 1.0 - best_confidence
+                cnn_detections.append({
+                    'x': x, 'y': y, 'w': w, 'h': h,
+                    'confidence': confidence, 'raw_pred': best_confidence
+                })
+
+                # Update prediction with best found
+                pred = best_confidence
+
+            ml_inference_time = time.time() - ml_start_time
+
+            # Store debug information
+            with detection_lock:
+                debug_processed_img = gray.copy()  # Store full image instead of resized
+                debug_ml_pred = pred
+                debug_ml_detected = ml_detected
+                debug_cnn_detections = cnn_detections.copy()
+                debug_processing_times['ml_inference'] = ml_inference_time
+
+            # Detection logic: CNN-only or Hybrid mode
+            mediapipe_start_time = time.time()
             final_detected = False
-            if use_hybrid:
+            mediapipe_detections = None
+
+            # Check if CNN-only mode is enabled
+            cnn_only_mode = config.get("cnn_only_mode", False)
+
+            if cnn_only_mode:
+                # CNN-only mode: Use only the ML model
+                final_detected = ml_detected
+                if config.get("show_debug", True):
+                    if ml_detected:
+                        print(f"[DETECTION] CNN-only mode: FACE DETECTED ({pred:.3f})")
+                    else:
+                        print(f"[DETECTION] CNN-only mode: NO FACE ({pred:.3f})")
+            elif use_hybrid:
                 # Always check MediaPipe first
                 rgb_game = cv2.cvtColor(current_game, cv2.COLOR_BGR2RGB)
                 results = face_detection.process(rgb_game)
+                mediapipe_detections = results.detections if results.detections else []
 
                 if results.detections:
                     # MediaPipe found face(s), check confidence
@@ -256,6 +367,10 @@ def detection_thread():
                     else:
                         print(f"[DETECTION] ML-only mode: NO FACE ({pred:.3f})")
 
+            # Calculate timing
+            mediapipe_time = time.time() - mediapipe_start_time
+            total_detection_time = time.time() - detection_start_time
+
             # Apply detection smoothing
             detection_history.append(final_detected)
             if len(detection_history) > smoothing_frames:
@@ -270,34 +385,48 @@ def detection_thread():
                 # Store debug data for main thread to display
                 with detection_lock:
                     # Store the debug information for main thread
-                    global debug_game_img, debug_ml_pred, debug_ml_detected, debug_final_detected, debug_detection_history
                     debug_game_img = current_game.copy()
                     debug_ml_pred = pred
                     debug_ml_detected = ml_detected
                     debug_final_detected = is_character_detected
                     debug_detection_history = detection_history.copy()
+                    debug_mediapipe_detections = mediapipe_detections
+                    debug_processing_times['mediapipe'] = mediapipe_time
+                    debug_processing_times['total_detection'] = total_detection_time
             
-            # Run MediaPipe face position detection
+            # Face position detection (CNN-only or MediaPipe)
             current_face_position = None
             if is_character_detected:
-                rgb_game = cv2.cvtColor(current_game, cv2.COLOR_BGR2RGB)
-                results = face_detection.process(rgb_game)
-                
-                if results.detections:
-                    detection = results.detections[0]
-                    bbox = detection.location_data.relative_bounding_box
-                    
-                    h, w = current_game.shape[:2]
-                    x = int(bbox.xmin * w)
-                    y = int(bbox.ymin * h)
-                    width = int(bbox.width * w)
-                    height = int(bbox.height * h)
-                    
-                    center_x = x + width // 2
-                    center_y = y + height // 2
-                    confidence = detection.score[0]
-                    
-                    current_face_position = (center_x, center_y, width, height, confidence)
+                if cnn_only_mode and cnn_detections:
+                    # Use CNN detection for position
+                    detection = cnn_detections[0]  # Use the first/best detection
+                    x, y, w, h = detection['x'], detection['y'], detection['w'], detection['h']
+
+                    center_x = x + w // 2
+                    center_y = y + h // 2
+                    confidence = detection['confidence']
+
+                    current_face_position = (center_x, center_y, w, h, confidence)
+                else:
+                    # Use MediaPipe for position (hybrid mode)
+                    rgb_game = cv2.cvtColor(current_game, cv2.COLOR_BGR2RGB)
+                    results = face_detection.process(rgb_game)
+
+                    if results.detections:
+                        detection = results.detections[0]
+                        bbox = detection.location_data.relative_bounding_box
+
+                        h, w = current_game.shape[:2]
+                        x = int(bbox.xmin * w)
+                        y = int(bbox.ymin * h)
+                        width = int(bbox.width * w)
+                        height = int(bbox.height * h)
+
+                        center_x = x + width // 2
+                        center_y = y + height // 2
+                        confidence = detection.score[0]
+
+                        current_face_position = (center_x, center_y, width, height, confidence)
             
             # Update global variables
             with detection_lock:
@@ -400,10 +529,94 @@ def create_face_overlay_optimized(webcam_frame, face_size, face_detection, mirro
     
     return face_crop, mask_3ch
 
+def create_debug_windows():
+    """Create comprehensive debugging visualization"""
+    global debug_processed_img, debug_ml_pred, debug_ml_detected, debug_final_detected
+    global debug_mediapipe_detections, debug_processing_times, debug_detection_stats
+    global debug_game_img, game_screen
+
+    try:
+        # Create main debug window with multiple panels
+        debug_height = 800
+        debug_width = 1200
+        debug_canvas = np.zeros((debug_height, debug_width, 3), dtype=np.uint8)
+
+        # Panel 1: Original game screen (top-left)
+        panel_w, panel_h = 300, 200
+        if game_screen is not None:
+            game_resized = cv2.resize(game_screen, (panel_w, panel_h))
+            debug_canvas[10:10+panel_h, 10:10+panel_w] = game_resized
+            cv2.putText(debug_canvas, "Game Screen", (10, 10+panel_h+20),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+        # Panel 2: CNN detections with bounding boxes (top-center)
+        if debug_processed_img is not None:
+            # Convert grayscale to BGR for display
+            ml_img_bgr = cv2.cvtColor(debug_processed_img, cv2.COLOR_GRAY2BGR)
+
+            # Draw CNN detection boxes
+            if debug_cnn_detections:
+                for detection in debug_cnn_detections:
+                    x, y, w, h = detection['x'], detection['y'], detection['w'], detection['h']
+                    confidence = detection['confidence']
+
+                    # Draw bounding box (green for high confidence, yellow for medium, red for low)
+                    if confidence > 0.7:
+                        color = (0, 255, 0)  # Green
+                    elif confidence > 0.5:
+                        color = (0, 255, 255)  # Yellow
+                    else:
+                        color = (0, 0, 255)  # Red
+
+                    cv2.rectangle(ml_img_bgr, (x, y), (x + w, y + h), color, 2)
+                    cv2.putText(ml_img_bgr, f"{confidence:.2f}", (x, y-5),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+
+            ml_resized = cv2.resize(ml_img_bgr, (panel_w, panel_h))
+            debug_canvas[10:10+panel_h, 320:320+panel_w] = ml_resized
+
+            cnn_count = len(debug_cnn_detections) if debug_cnn_detections else 0
+            cv2.putText(debug_canvas, f"CNN Detections ({cnn_count})",
+                       (320, 10+panel_h+20), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                       (0, 255, 0) if debug_ml_detected else (0, 0, 255), 2)
+
+        # Panel 3: MediaPipe detections (top-right)
+        if game_screen is not None:
+            mp_img = game_screen.copy()
+            mp_resized = cv2.resize(mp_img, (panel_w, panel_h))
+
+            # Draw MediaPipe detections
+            if debug_mediapipe_detections:
+                for detection in debug_mediapipe_detections:
+                    bbox = detection.location_data.relative_bounding_box
+                    x = int(bbox.xmin * panel_w)
+                    y = int(bbox.ymin * panel_h)
+                    w = int(bbox.width * panel_w)
+                    h = int(bbox.height * panel_h)
+                    confidence = detection.score[0]
+
+                    cv2.rectangle(mp_resized, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                    cv2.putText(mp_resized, f"{confidence:.2f}", (x, y-5),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+
+            debug_canvas[10:10+panel_h, 630:630+panel_w] = mp_resized
+            mp_count = len(debug_mediapipe_detections) if debug_mediapipe_detections else 0
+            cv2.putText(debug_canvas, f"MediaPipe ({mp_count} faces)",
+                       (630, 10+panel_h+20), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                       (0, 255, 0) if mp_count > 0 else (0, 0, 255), 2)
+
+        cv2.imshow("Face Detection Debug", debug_canvas)
+
+    except Exception as e:
+        print(f"[DEBUG] Error creating debug window: {e}")
+        import traceback
+        traceback.print_exc()
+
 def main():
     """Main loop optimized for 60fps"""
     global webcam_frame, game_screen, character_detected, face_position
     global webcam_face_ready, webcam_mask_ready, detection_confidence
+    global debug_detection_stats, debug_processing_times
     
     print("[INFO] Starting optimized face overlay system...")
     print("[INFO] Press 'd' key to toggle debug windows")
@@ -543,56 +756,23 @@ def main():
                 else:
                     overlay_rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
                 
-                # Debug windows for webcam and output
+                # Enhanced debug windows
                 if config.get("show_debug_windows", False) and webcam_frame is not None:
-                    # Create Face Detection Debug window (moved from detection thread)
-                    if debug_game_img is not None:
-                        debug_img = debug_game_img.copy()
+                    try:
+                        # Update detection statistics
+                        with detection_lock:
+                            debug_detection_stats['total_frames'] += 1
+                            if debug_ml_detected:
+                                debug_detection_stats['ml_detections'] += 1
+                            if debug_mediapipe_detections and len(debug_mediapipe_detections) > 0:
+                                debug_detection_stats['mediapipe_detections'] += 1
+                            if debug_final_detected:
+                                debug_detection_stats['final_detections'] += 1
 
-                        # Add ML prediction info
-                        ml_color = (0, 255, 0) if debug_ml_detected else (0, 0, 255)
-                        cv2.putText(debug_img, f"ML Pred: {debug_ml_pred:.3f} ({'FACE' if debug_ml_detected else 'NO FACE'})",
-                                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, ml_color, 2)
-
-                        # Add MediaPipe detection info
-                        rgb_game = cv2.cvtColor(debug_game_img, cv2.COLOR_BGR2RGB)
-                        mp_results = face_detection.process(rgb_game)
-
-                        if mp_results.detections:
-                            for detection in mp_results.detections:
-                                bbox = detection.location_data.relative_bounding_box
-                                h, w = debug_game_img.shape[:2]
-                                x = int(bbox.xmin * w)
-                                y = int(bbox.ymin * h)
-                                width = int(bbox.width * w)
-                                height = int(bbox.height * h)
-
-                                # Draw MediaPipe detection box
-                                cv2.rectangle(debug_img, (x, y), (x + width, y + height), (255, 0, 0), 2)
-                                confidence = detection.score[0]
-                                cv2.putText(debug_img, f"MP: {confidence:.2f}",
-                                           (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
-
-                            mp_text = f"MediaPipe: DETECTED ({len(mp_results.detections)} faces)"
-                            mp_color = (255, 0, 0)
-                        else:
-                            mp_text = "MediaPipe: NO FACE"
-                            mp_color = (0, 0, 255)
-
-                        cv2.putText(debug_img, mp_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, mp_color, 2)
-
-                        # Add final decision
-                        final_color = (0, 255, 0) if debug_final_detected else (0, 0, 255)
-                        final_text = f"FINAL: {'FACE DETECTED' if debug_final_detected else 'NO FACE'}"
-                        cv2.putText(debug_img, final_text, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, final_color, 2)
-
-                        # Add smoothing info
-                        history_text = f"History: {debug_detection_history} -> {debug_final_detected}"
-                        cv2.putText(debug_img, history_text, (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-
-                        # Show debug window
-                        debug_resized = cv2.resize(debug_img, (640, 480))
-                        cv2.imshow("Face Detection Debug", debug_resized)
+                        # Create comprehensive debug visualization
+                        create_debug_windows()
+                    except Exception as e:
+                        print(f"[DEBUG] Error in debug windows: {e}")
                     # Show webcam with face detection
                     webcam_debug = webcam_frame.copy()
 
@@ -644,6 +824,23 @@ def main():
                     output_resized = cv2.resize(output_debug, (640, 480))
                     cv2.imshow("Final Output", output_resized)
 
+                # Create a simple control window for keyboard input
+                control_img = np.zeros((120, 450, 3), dtype=np.uint8)
+                cv2.putText(control_img, "Face Detection Control", (10, 25),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                cv2.putText(control_img, "Press 'd' debug, 'c' CNN-only, 'q' quit", (10, 50),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
+                debug_status = "ON" if config.get("show_debug_windows", False) else "OFF"
+                cv2.putText(control_img, f"Debug: {debug_status}", (10, 75),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0) if config.get("show_debug_windows", False) else (0, 0, 255), 1)
+
+                cnn_only = "ON" if config.get("cnn_only_mode", False) else "OFF"
+                cv2.putText(control_img, f"CNN-Only: {cnn_only}", (10, 95),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0) if config.get("cnn_only_mode", False) else (0, 0, 255), 1)
+
+                cv2.imshow("Control Panel", control_img)
+
                 # Check for keyboard input (non-blocking)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord('d'):
@@ -654,6 +851,39 @@ def main():
                         cv2.destroyWindow("Face Detection Debug")
                         cv2.destroyWindow("Webcam Debug")
                         cv2.destroyWindow("Final Output")
+                elif key == ord('c'):
+                    # Toggle CNN-only mode
+                    config["cnn_only_mode"] = not config.get("cnn_only_mode", False)
+                    status = "ENABLED" if config["cnn_only_mode"] else "DISABLED"
+                    print(f"[INFO] CNN-only mode {status}")
+                    if config["cnn_only_mode"]:
+                        print("[INFO] MediaPipe disabled - using only CNN for detection")
+                    else:
+                        print("[INFO] Hybrid mode enabled - using both CNN and MediaPipe")
+                elif key == ord('s'):
+                    # Save current frame for analysis
+                    if debug_game_img is not None:
+                        timestamp = int(time.time())
+                        filename = f"debug_frame_{timestamp}.png"
+                        cv2.imwrite(filename, debug_game_img)
+                        print(f"[DEBUG] Saved frame to {filename}")
+                        print(f"[DEBUG] ML Prediction: {debug_ml_pred:.3f}, Detected: {debug_ml_detected}")
+                        print(f"[DEBUG] Final Detection: {debug_final_detected}")
+                elif key == ord('r'):
+                    # Reset statistics
+                    with detection_lock:
+                        debug_detection_stats.update({
+                            'total_frames': 0,
+                            'ml_detections': 0,
+                            'mediapipe_detections': 0,
+                            'final_detections': 0,
+                            'false_positives': 0,
+                            'false_negatives': 0
+                        })
+                    print("[DEBUG] Statistics reset")
+                elif key == ord('q'):
+                    print("[INFO] Quit requested")
+                    break
 
                 # Send to virtual camera
                 cam.send(overlay_rgb)

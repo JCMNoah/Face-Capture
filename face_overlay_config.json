@@ -21,5 +21,7 @@
     1080
   ],
   "high_quality_mode": true,
-  "optimize_performance": true
+  "optimize_performance": true,
+  "cnn_only_mode": false,
+  "mediapipe_confidence": 0.3
 }

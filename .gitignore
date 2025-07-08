@@ -617,3 +617,6 @@ dataset/no_face/no_face_305.png
 dataset/no_face/no_face_306.png
 dataset/no_face/no_face_307.png
 dataset/no_face/no_face_308.png
+face_detector_model.h5
+training_history.png
+best_face_detector_model.h5

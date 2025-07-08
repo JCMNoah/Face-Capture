@@ -2,32 +2,24 @@
   "game_region": {
     "top": 200,
     "left": 700,
-    "width": 500,
-    "height": 500
+    "width": 1000,
+    "height": 1000
   },
   "input_size": 184,
-  "webcam_face_size": 150,
-  "fps": 30,
-  "face_detection_confidence": 0.7,
+  "webcam_face_size": 200,
+  "fps": 60,
+  "face_detection_confidence": 0.5,
   "face_threshold": 0.5,
   "overlay_alpha": 1.0,
   "mirror_webcam": true,
   "show_debug": true,
-  "transparent_when_no_face": true,
   "disable_game_background": true,
-  "use_hybrid_detection": true,
-  "mediapipe_confidence": 0.3,
-  "detection_smoothing": 3,
   "use_transparency": true,
-  "skip_frames": 0,
-  "webcam_fps": 30,
+  "webcam_fps": 60,
   "webcam_resolution": [
-    1280,
-    720
+    1920,
+    1080
   ],
-  "optimize_performance": true,
-  "prioritize_camera_smoothness": false,
-  "detection_interval": 0.1,
-  "cache_detection_time": 2.0,
-  "high_quality_mode": true
+  "high_quality_mode": true,
+  "optimize_performance": true
 }
